@@ -80,9 +80,17 @@ def naive_temp(p : AutoregressiveSampler, context, temp, seq_len):
         output_scores=True,
         output_logits=True,
     )
+
+    # Tensor of raw output log(p_token)
     unscaled_logits = torch.stack(output.logits, dim=0)
+
+    # Tensor after temperature scaling: log p(token)^(1/temp) -> proposal
     scaled_logits = torch.stack(output.scores, dim=0)
+
+    # New tokens
     tokens = output.sequences[0][c:]
+    
+    # Prompt + generated tokens
     prop = output.sequences[0].tolist()
 
     assert len(tokens) == unscaled_logits.shape[0] == scaled_logits.shape[0]
@@ -90,7 +98,10 @@ def naive_temp(p : AutoregressiveSampler, context, temp, seq_len):
 
     idx = tokens.view(unscaled_logits.shape[0], 1, 1)
 
+    # target distibution
     log_probs_unnorm = (1/temp * torch.gather(F.log_softmax(unscaled_logits, dim=-1), -1, idx)).view(-1).tolist()
+
+    # proposal distribution
     log_probs_norm = torch.gather(F.log_softmax(scaled_logits, dim=-1), -1, idx).view(-1).tolist()
 
     assert len(tokens) == len(log_probs_unnorm) == len(log_probs_norm)
@@ -111,6 +122,8 @@ def max_swap(p : AutoregressiveSampler, context, temp, mcmc_steps, max_new_token
 
     print(max_new_tokens)
     assert max_new_tokens % block_num == 0
+
+    # block length?
     jump_size = int(max_new_tokens // block_num)
     print(jump_size)
     attempts = 0
