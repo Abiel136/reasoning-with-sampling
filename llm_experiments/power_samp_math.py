@@ -40,9 +40,11 @@ if __name__ == "__main__":
     parser.add_argument("--device", action = "store", type = str, dest = "device", default = "cuda" if torch.cuda.is_available() else 'cpu')
     parser.add_argument("--batch_idx", action = "store", type = int, default = 0)
     parser.add_argument("--seed", action = "store", type = int, default = 0)
+    parser.add_argument("--max_tokens", action = "store", type = int, default= 1024)
     args = parser.parse_args()
 
     random.seed(0)
+
 
 
     model = args.model
@@ -51,6 +53,8 @@ if __name__ == "__main__":
     cot = args.cot
     temp = args.temperature
     mcmc_steps = args.mcmc_steps
+    #previously used to be 3072
+    max_tokens = args.max_tokens
 
     save_str = os.path.join(args.save_str, model)
     os.makedirs(save_str, exist_ok=True)
@@ -62,7 +66,8 @@ if __name__ == "__main__":
     if model == "qwen":
         model_str = "Qwen/Qwen2.5-7B"
     elif model == "qwen_math":
-        model_str = "Qwen/Qwen2.5-Math-7B"
+        # model_str = "Qwen/Qwen2.5-Math-7B"
+        model_str = "Qwen/Qwen2.5-Math-1.5B"
     elif model == "qwen_math_grpo":
         model_str = "stellalisy/rethink_rlvr_reproduce-ground_truth-qwen2.5_math_7b-lr5e-7-kl0.00-step150"
     elif model == "phi":
@@ -96,20 +101,20 @@ if __name__ == "__main__":
         input_ids = tokenizer.encode(input_text, return_tensors="pt").to(device)
         prefx = [idx.item() for idx in input_ids[0]]
 
-        naive_temp_output = hf_model.generate(input_ids, max_new_tokens=3072, 
+        naive_temp_output = hf_model.generate(input_ids, max_new_tokens=max_tokens, 
                                 return_dict_in_generate=True, output_scores=True, do_sample = True, temperature = temp)
         
         print(tokenizer.decode(naive_temp_output[0][:, len(input_ids[0]):].squeeze().to("cpu"), skip_special_tokens=True))
         print("naive done")
         
         
-        std_output = hf_model.generate(input_ids, max_new_tokens=3072, 
+        std_output = hf_model.generate(input_ids, max_new_tokens=max_tokens, 
                                 return_dict_in_generate=True, output_scores=True, do_sample = True)
         
         print(tokenizer.decode(std_output[0][:, len(input_ids[0]):].squeeze().to("cpu"), skip_special_tokens=True))
         print("std done")
 
-        mcmc_power_samp_output, _, _, acceptance_ratio = mcmc_power_samp(autoreg_sampler, prefx, temp, mcmc_steps, max_new_tokens=3072)
+        mcmc_power_samp_output, _, _, acceptance_ratio = mcmc_power_samp(autoreg_sampler, prefx, temp, mcmc_steps, max_new_tokens=max_tokens)
 
         print(len(std_output))
         print(len(naive_temp_output))
