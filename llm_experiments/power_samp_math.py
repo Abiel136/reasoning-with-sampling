@@ -41,6 +41,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_idx", action = "store", type = int, default = 0)
     parser.add_argument("--seed", action = "store", type = int, default = 0)
     parser.add_argument("--max_tokens", action = "store", type = int, default= 1024)
+    parser.add_argument("--batch_size", action = "store", type = int, default = 100)
     args = parser.parse_args()
 
     random.seed(0)
@@ -55,19 +56,21 @@ if __name__ == "__main__":
     mcmc_steps = args.mcmc_steps
     #previously used to be 3072
     max_tokens = args.max_tokens
+    batch_size = args.batch_size
 
     save_str = os.path.join(args.save_str, model)
     os.makedirs(save_str, exist_ok=True)
 
 
-    print(model)
-    print(device)
-    print(mcmc_steps)
+    print(f"Model: {model}")
+    print(f"Device: {device}")
+    print(f"MCMC Steps: {mcmc_steps}")
     if model == "qwen":
         model_str = "Qwen/Qwen2.5-7B"
     elif model == "qwen_math":
         # model_str = "Qwen/Qwen2.5-Math-7B"
-        model_str = "Qwen/Qwen2.5-Math-1.5B"
+        # model_str = "Qwen/Qwen2.5-Math-1.5B"
+        model_str = "Qwen/Qwen2.5-0.5B-Instruct"
     elif model == "qwen_math_grpo":
         model_str = "stellalisy/rethink_rlvr_reproduce-ground_truth-qwen2.5_math_7b-lr5e-7-kl0.00-step150"
     elif model == "phi":
@@ -89,12 +92,13 @@ if __name__ == "__main__":
     print("loaded models")
     results = []
 
-    start = 100*args.batch_idx
-    end = 100*(args.batch_idx+1)
+    # Default batch size was 100
+    start = batch_size*args.batch_idx
+    end = batch_size*(args.batch_idx+1)
 
     for problem, data in tqdm(enumerate(dataset[start:end]), desc = "Benchmark on MATH"):
         question = data["prompt"]
-        print(question)
+        print(f"Question: {question}")
         answer = data["answer"]
 
         input_text = format_prompt(question, model, tokenizer, cot)
@@ -122,6 +126,7 @@ if __name__ == "__main__":
         print(tokenizer.decode(torch.tensor([mcmc_power_samp_output], dtype=torch.long, device=device).squeeze().to("cpu"), skip_special_tokens=True))
         print("mcmc done")
 
+        # extract just the generated tokens (stripping the prompt)
         naive_generated_ids = naive_temp_output[0][:, len(input_ids[0]):].squeeze().to("cpu")
         std_generated_ids = std_output[0][:, len(input_ids[0]):].squeeze().to("cpu")
         mcmc_power_samp_ids = torch.tensor([mcmc_power_samp_output], dtype=torch.long, device=device).squeeze().to("cpu")
@@ -134,11 +139,11 @@ if __name__ == "__main__":
         std_answer = parse_answer(std_completion)
         mcmc_answer = parse_answer(mcmc_completion)
         
-        print(naive_answer)
-        print(std_answer)
-        print(mcmc_answer)
-        print(question)
-        print(answer)
+        print("naive answer: ", naive_answer)
+        print("std answer: ", std_answer)
+        print("mcmc answer: ",mcmc_answer)
+        print("question: ", question)
+        print("answer: ", answer)
         print(f'Acceptance: {acceptance_ratio}')
 
 
