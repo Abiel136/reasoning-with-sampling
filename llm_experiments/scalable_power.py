@@ -65,6 +65,20 @@ def dist_temp_scale(logit_p, temp):
 
 # low-temperature sampling proposal distribution
 def naive_temp(p : AutoregressiveSampler, context, temp, seq_len):
+    """
+    Docstring for naive_temp
+    
+    :param p:
+     Base Model
+    :type p: AutoregressiveSampler
+    :param context: input into model
+    :param temp: alpha = 1/temp
+    :param seq_len: Description
+
+    Returns:
+    :prop:  Prompt + generated tokens
+    : log_probs_norm: target_distribution prob for generated tokens
+    """
     c = len(context)
     device = p.device
     tokenizer = p.tokenizer
@@ -99,36 +113,130 @@ def naive_temp(p : AutoregressiveSampler, context, temp, seq_len):
     # Indices of sampled tokens for gather; shape: (num_new_tokens, 1, 1)
     idx = tokens.view(unscaled_logits.shape[0], 1, 1)
 
-    # Target distribution: log p(token)^(1/temp) per position; shape after .view(-1): (num_new_tokens,)
+    # Target distribution: log p(token)^(1/temp) per position. Softmax then take power. No need to sum over future due to intermediate distributions; shape after .view(-1): (num_new_tokens,)
     log_probs_unnorm = (1/temp * torch.gather(F.log_softmax(unscaled_logits, dim=-1), -1, idx)).view(-1).tolist()
 
-    # Proposal distribution: log q(token) from temperature-scaled model; shape after .view(-1): (num_new_tokens,)
+    # Proposal distribution: log q(token) from temperature-scaled model. Take power then softmax so all proper probabilities (local norm); shape after .view(-1): (num_new_tokens,)
     log_probs_norm = torch.gather(F.log_softmax(scaled_logits, dim=-1), -1, idx).view(-1).tolist()
 
     assert len(tokens) == len(log_probs_unnorm) == len(log_probs_norm)
 
     return prop, log_probs_norm, log_probs_unnorm
 
+def top_K_from_base(p : AutoregressiveSampler, context, K):
+    device = p.device
+    tokenizer = p.tokenizer
+    input_ids = torch.tensor([context], dtype=torch.long, device=device)
+    output = p.model.generate(
+        input_ids=input_ids,
+        max_new_tokens=1,
+        do_sample=True,
+        temperature=1,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.eos_token_id,
+        return_dict_in_generate=True,
 
-# alpha = infty power sampling; temp is for proposal distribution
-def max_swap(p : AutoregressiveSampler, context, temp, mcmc_steps, max_new_tokens, block_num=16):
-    c = len(context)
-    print(f'Temp: {temp}')
+        # Dont need the scaled logits
+        output_scores=False,
+        output_logits=True,
+    )  
+
+    # unscaled_logits shape: (num_new_tokens, 1, vocab_size)
+    unscaled_logits = torch.stack(output.logits, dim=0)
+
+    top_indices = torch.topk(unscaled_logits.squeeze(1), k=K, dim=-1).indices.squeeze(0)
+    # top_indices shape: (K) — the token IDs
+    return top_indices
+
+
+
+
+
+def compute_xi(p, context, test_token, temp, M, T):
+    context = context +[test_token]
+
+    device = p.device
+    tokenizer = p.tokenizer
+    input_ids = torch.tensor([context], dtype=torch.long, device=device)
+    total = []
+    max_new_tokens = T - len(context)
+    for rollout in range(M):
+        c = len(context)
+        output = p.model.generate(
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=1,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.eos_token_id,
+            return_dict_in_generate=True,
+
+            # Dont need the scaled logits
+            output_scores=False,
+            output_logits=True,
+        )
+
+        tokens = output.sequences[0][c:]
+        unscaled_logits = torch.stack(output.logits, dim=0)
+
+        idx = tokens.view(unscaled_logits.shape[0], 1, 1)
+        log_probs_power = ((1/temp-1) * torch.gather(F.log_softmax(unscaled_logits, dim=-1), -1, idx)).view(-1).sum()
+        probs_power = torch.exp(log_probs_power)
+        total += [probs_power]
+
+    xi = sum(total)/M
+    xi_loo = sum(total[:-1])/(M-1)
+    return xi, xi_loo
+
+
+
+
+    
+
+
+# power sampling using lookahead approximations
+def scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K):
+    """
+    Main loop for sampling
+    
+    :param p: Base mode;
+    :type p: AutoregressiveSampler
+    :param context: Prompt added depending on dataset
+    :param temp: Alpha = 1/temp. 
+    :param M: Number of rollouts - can change later
+    :param T: Trajectory Length
+    :param K: size of vocab for expectation of xi
+    """
+
+    print(f'alpha: {1/temp}')
     gen = []
-    if context is not None:
-        gen = context.copy()
+    if prompt is not None:
+        gen = prompt.copy()
     log_probs_norm = []
     log_probs_unnorm = []
 
+    c = len(prompt)
+    total_input = []
+    if prompt is not None:
+        total_input = prompt.copy()
 
-    print(max_new_tokens)
-    assert max_new_tokens % block_num == 0
 
-    # block length?
-    jump_size = int(max_new_tokens // block_num)
-    print(jump_size)
-    attempts = 0
-    acceptances = 0
+    for t in range(T):
+        # G is the set of promising candidates according to the base model
+        G = top_K_from_base(p, total_input, K)
+        xis = []
+        xis_loo = []
+        for token in G:
+            # token is xt and the xt's are everything in G. Need to find all the p^ for each xt and then sample from this
+            xi, xi_loo = compute_xi(p, total_input, token, temp, M, T+c)
+            xis += [xi]
+            xis_loo += [xi_loo]
+        
+
+
+
+
+
 
 
     for _ in tqdm(range(block_num)):
@@ -140,64 +248,6 @@ def max_swap(p : AutoregressiveSampler, context, temp, mcmc_steps, max_new_token
             attempts+=1
             t = len(gen)
             idx = random.randint(c, t-1)
-            # llm query takes the burden of time
-            prop, log_prob_prop, target_log_prob_prop = naive_temp(p, gen[:idx], temp=temp, seq_len=t)
-            s = len(prop)
-            assert(len(log_prob_prop) == s - idx)
-            assert(len(target_log_prob_prop) == s - idx)
-            log_prob_cur = log_probs_norm.copy()[idx-c:s-c]
-            target_log_prob_cur = log_probs_unnorm.copy()[idx-c:s-c]
-            log_r = sum(target_log_prob_prop) - sum(target_log_prob_cur)
-
-            if log_r > 0:
-                acceptances+=1
-                gen = prop.copy()
-                log_probs_norm[idx-c:] = log_prob_prop.copy()
-                log_probs_unnorm[idx-c:] = target_log_prob_prop.copy()
-
-                del prop
-                del log_prob_prop
-                del target_log_prob_cur
-
-        if p.tokenizer.eos_token_id in gen:
-            eos_idx = gen.index(p.tokenizer.eos_token_id)
-            gen = gen[:eos_idx + 1]
-            log_probs_norm = log_probs_norm[:eos_idx + 1]
-            log_probs_unnorm = log_probs_unnorm[:eos_idx + 1]
-            acceptance_ratio = acceptances/attempts
-            return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
-
-    acceptance_ratio = acceptances/attempts
-    return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
-
-# power sampling with autoregressive mcmc
-def mcmc_power_samp(p : AutoregressiveSampler, context, temp, mcmc_steps, max_new_tokens, block_num=16):
-    c = len(context)
-    print(f'alpha: {1/temp}')
-    gen = []
-    if context is not None:
-        gen = context.copy()
-    log_probs_norm = []
-    log_probs_unnorm = []
-
-
-    print(max_new_tokens)
-    assert max_new_tokens % block_num == 0
-    jump_size = int(max_new_tokens // block_num)
-    print(jump_size)
-    attempts = 0
-    acceptances = 0
-
-
-    for _ in tqdm(range(block_num)):
-        gen, lp_norm, lp_unnorm = naive_temp(p, gen, temp=temp, seq_len=jump_size+len(gen))
-        log_probs_norm.extend(lp_norm)
-        log_probs_unnorm.extend(lp_unnorm)
-
-        for _ in tqdm(range(mcmc_steps)):
-            attempts+=1
-            t = len(gen)
-            idx = random.randint(c, t-1) # This means that you always keep the original prompt in the context
             # llm query takes the burden of time
             prop, log_prob_prop, target_log_prob_prop = naive_temp(p, gen[:idx], temp=temp, seq_len=t)
             s = len(prop)
