@@ -64,16 +64,16 @@ def dist_temp_scale(logit_p, temp):
     return logit_p * torch.tensor(1 / temp, dtype=logit_p.dtype, device=logit_p.device)
 
 # low-temperature sampling proposal distribution
-def naive_temp(p : AutoregressiveSampler, context, temp, seq_len):
+@torch.no_grad()
+def low_temp(p : AutoregressiveSampler, context, temp):
     """
-    Docstring for naive_temp
+    Samples 1 token using low temp sampling
     
     :param p:
      Base Model
     :type p: AutoregressiveSampler
     :param context: input into model
     :param temp: alpha = 1/temp
-    :param seq_len: Description
 
     Returns:
     :prop:  Prompt + generated tokens
@@ -85,45 +85,37 @@ def naive_temp(p : AutoregressiveSampler, context, temp, seq_len):
     input_ids = torch.tensor([context], dtype=torch.long, device=device)
     output = p.model.generate(
         input_ids=input_ids,
-        max_new_tokens=seq_len - c,
+        max_new_tokens=1,
         do_sample=True,
         temperature=temp,
         eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.eos_token_id, 
         return_dict_in_generate=True,
-        output_scores=True,
-        output_logits=True,
+        output_scores=False,
+        output_logits=False,
     )
 
-    # Raw model logits before temperature scaling; shape: (num_new_tokens, 1, vocab_size)
-    unscaled_logits = torch.stack(output.logits, dim=0)
+    # New token
+    token = output.sequences[0][c:]
 
-    # Logits after temperature scaling (logits / temp); shape: (num_new_tokens, 1, vocab_size)
-    scaled_logits = torch.stack(output.scores, dim=0)
-
-    # New tokens
-    tokens = output.sequences[0][c:]
-    
-    # Prompt + generated tokens
-    prop = output.sequences[0].tolist()
-
-    assert len(tokens) == unscaled_logits.shape[0] == scaled_logits.shape[0]
+    return token
 
 
-    # Indices of sampled tokens for gather; shape: (num_new_tokens, 1, 1)
-    idx = tokens.view(unscaled_logits.shape[0], 1, 1)
+@torch.no_grad()
+def top_K_from_base(p : AutoregressiveSampler, context, K, temp):
+    """
+    Get the top K tokens by base model probability and their powered log-probabilities.
 
-    # Target distribution: log p(token)^(1/temp) per position. Softmax then take power. No need to sum over future due to intermediate distributions; shape after .view(-1): (num_new_tokens,)
-    log_probs_unnorm = (1/temp * torch.gather(F.log_softmax(unscaled_logits, dim=-1), -1, idx)).view(-1).tolist()
+    :param p: Base model
+    :type p: AutoregressiveSampler
+    :param context: Token IDs for the current context
+    :param K: Number of top tokens to return
+    :param temp: Alpha = 1/temp for power scaling
 
-    # Proposal distribution: log q(token) from temperature-scaled model. Take power then softmax so all proper probabilities (local norm); shape after .view(-1): (num_new_tokens,)
-    log_probs_norm = torch.gather(F.log_softmax(scaled_logits, dim=-1), -1, idx).view(-1).tolist()
-
-    assert len(tokens) == len(log_probs_unnorm) == len(log_probs_norm)
-
-    return prop, log_probs_norm, log_probs_unnorm
-
-def top_K_from_base(p : AutoregressiveSampler, context, K):
+    Returns:
+    :top_indices: Token IDs of the K most probable tokens under the base model; shape (K,)
+    :power_probs: Powered probs p(token)^(1/temp) for each top-K token; length K array
+    """
     device = p.device
     tokenizer = p.tokenizer
     input_ids = torch.tensor([context], dtype=torch.long, device=device)
@@ -145,14 +137,34 @@ def top_K_from_base(p : AutoregressiveSampler, context, K):
     unscaled_logits = torch.stack(output.logits, dim=0)
 
     top_indices = torch.topk(unscaled_logits.squeeze(1), k=K, dim=-1).indices.squeeze(0)
+    top_indices_3d = top_indices.view(1,1,K)
+    power_log_probs = (1/temp * torch.gather(F.log_softmax(unscaled_logits, dim=-1), -1, top_indices_3d)).view(-1)
+    power_probs = torch.exp(power_log_probs)
     # top_indices shape: (K) — the token IDs
-    return top_indices
+    return top_indices, power_probs
 
 
 
 
 
-def compute_xi(p, context, test_token, temp, M, T):
+@torch.no_grad()
+def compute_xi(p: AutoregressiveSampler, context, test_token, temp, M, T):
+    """
+    Estimate ζ(xt) via M rollouts from the base model conditioned on context + test_token.
+    Each rollout computes prod_{s>t} p(xs)^(1/temp - 1) along the sampled trajectory.
+
+    :param p: Base model
+    :type p: AutoregressiveSampler
+    :param context: Token IDs for the current context (before test_token)
+    :param test_token: Candidate token xt to evaluate
+    :param temp: Alpha = 1/temp for power scaling
+    :param M: Number of rollouts for Monte Carlo estimate
+    :param T: Total trajectory length (prompt + generation)
+
+    Returns:
+    :xi: Monte Carlo estimate of ζ(xt), averaged over M rollouts; scalar tensor
+    :xi_loos: Leave-one-out estimates of ζ(xt), each excluding one rollout; shape (M,)
+    """
     context = context +[test_token]
 
     device = p.device
@@ -184,17 +196,17 @@ def compute_xi(p, context, test_token, temp, M, T):
         probs_power = torch.exp(log_probs_power)
         total += [probs_power]
 
-    xi = sum(total)/M
-    xi_loo = sum(total[:-1])/(M-1)
-    return xi, xi_loo
+    total_tensor = torch.stack(total)
+    xi = total_tensor.mean() 
+    # xi_loo = sum(total[:-1])/(M-1)
+    xi_loos = (total_tensor.sum()-total_tensor)/(M-1)
+    return xi, xi_loos
 
 
-
-
-    
 
 
 # power sampling using lookahead approximations
+@torch.no_grad()
 def scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K):
     """
     Main loop for sampling
@@ -209,74 +221,64 @@ def scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K):
     """
 
     print(f'alpha: {1/temp}')
-    gen = []
-    if prompt is not None:
-        gen = prompt.copy()
-    log_probs_norm = []
-    log_probs_unnorm = []
 
     c = len(prompt)
     total_input = []
     if prompt is not None:
         total_input = prompt.copy()
 
-
-    for t in range(T):
+    # All the way upto the last token which is sampled using low-temp
+    for t in range(T-1):
         # G is the set of promising candidates according to the base model
-        G = top_K_from_base(p, total_input, K)
+        G, power_probs= top_K_from_base(p, total_input, K, temp)
         xis = []
-        xis_loo = []
+
+        # List of lists containing every loo for each x_t
+        xis_loos = []
+        
         for token in G:
             # token is xt and the xt's are everything in G. Need to find all the p^ for each xt and then sample from this
-            xi, xi_loo = compute_xi(p, total_input, token, temp, M, T+c)
+            xi, xi_loos = compute_xi(p, total_input, token, temp, M, T+c)
             xis += [xi]
-            xis_loo += [xi_loo]
+            xis_loos += [xi_loos]
+
+        # probs_jk = get_jk(p, G, xis, xis_loo, temp)
         
+        xis_tensor = torch.stack(xis)
+        unnorm_probs = power_probs*xis_tensor
+        probs_a_pow = unnorm_probs/ unnorm_probs.sum()
+
+        # xis_loo_matrix shape: (K, M) — each row is LOO estimates for one token across rollouts                                                                                                                             
+        xis_loo_matrix = torch.stack(xis_loos)  
+
+        # Broadcast power_probs (K,) -> (K, 1) to multiply with (K, M)
+        unnorm_loo = power_probs.unsqueeze(1) * xis_loo_matrix
+
+        # Normalize over tokens (dim=0) for each rollout s; shape: (K, M)
+        probs_a_pow_loo = unnorm_loo / unnorm_loo.sum(dim=0, keepdim=True)
+
+        # Now sum all the rollouts: shape(K,)
+        probs_a_pow_loo_summed = probs_a_pow_loo.sum(dim =1)
+
+        # Shape (K, )
+        probs_jk = M*probs_a_pow - ((M-1)/M) * probs_a_pow_loo_summed
+
+        probs_jk = probs_jk.clamp(min=0)                                                                                                                                                                         
+        probs_jk = probs_jk / probs_jk.sum()
+
+        sampled_idx = torch.multinomial(probs_jk, 1).item()
+        sampled_token = G[sampled_idx].item()
+        total_input.append(sampled_token)
+
+    last_token = low_temp(p, total_input, temp).item()
+    total_input.append(last_token)
 
 
+    if p.tokenizer.eos_token_id in total_input:
+            eos_idx = total_input.index(p.tokenizer.eos_token_id)
+            total_input = total_input[:eos_idx + 1]
 
-
-
-
-
-    for _ in tqdm(range(block_num)):
-        gen, lp_norm, lp_unnorm = naive_temp(p, gen, temp=temp, seq_len=jump_size+len(gen))
-        log_probs_norm.extend(lp_norm)
-        log_probs_unnorm.extend(lp_unnorm)
-
-        for _ in tqdm(range(mcmc_steps)):
-            attempts+=1
-            t = len(gen)
-            idx = random.randint(c, t-1)
-            # llm query takes the burden of time
-            prop, log_prob_prop, target_log_prob_prop = naive_temp(p, gen[:idx], temp=temp, seq_len=t)
-            s = len(prop)
-            assert(len(log_prob_prop) == s - idx)
-            assert(len(target_log_prob_prop) == s - idx)
-            log_prob_cur = log_probs_norm.copy()[idx-c:s-c]
-            target_log_prob_cur = log_probs_unnorm.copy()[idx-c:s-c]
-            log_r = sum(target_log_prob_prop) + sum(log_prob_cur) - sum(target_log_prob_cur) - sum(log_prob_prop)
-
-            if np.random.rand() < np.exp(log_r):
-                acceptances+=1
-                gen = prop.copy()
-                log_probs_norm[idx-c:] = log_prob_prop.copy()
-                log_probs_unnorm[idx-c:] = target_log_prob_prop.copy()
-
-                del prop
-                del log_prob_prop
-                del target_log_prob_cur
-
-        if p.tokenizer.eos_token_id in gen:
-            eos_idx = gen.index(p.tokenizer.eos_token_id)
-            gen = gen[:eos_idx + 1]
-            log_probs_norm = log_probs_norm[:eos_idx + 1]
-            log_probs_unnorm = log_probs_unnorm[:eos_idx + 1]
-            acceptance_ratio = acceptances/attempts
-            return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
-
-    acceptance_ratio = acceptances/attempts
-    return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
+    return total_input
 
 
 def format_prompt(question, model, tokenizer, cot=True):
