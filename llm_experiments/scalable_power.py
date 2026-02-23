@@ -79,25 +79,12 @@ def low_temp(p : AutoregressiveSampler, context, temp):
     :prop:  Prompt + generated tokens
     : log_probs_norm: target_distribution prob for generated tokens
     """
-    c = len(context)
     device = p.device
-    tokenizer = p.tokenizer
     input_ids = torch.tensor([context], dtype=torch.long, device=device)
-    output = p.model.generate(
-        input_ids=input_ids,
-        max_new_tokens=1,
-        do_sample=True,
-        temperature=temp,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.eos_token_id, 
-        return_dict_in_generate=True,
-        output_scores=False,
-        output_logits=False,
-    )
-
-    # New token
-    token = output.sequences[0][c:]
-
+    logits = p.model(input_ids).logits[0, -1, :]
+    probs = F.softmax(logits / temp, dim=-1)
+    token = torch.multinomial(probs, 1)
+    del logits, probs
     return token
 
 
@@ -117,30 +104,15 @@ def top_K_from_base(p : AutoregressiveSampler, context, K, temp):
     :power_probs: Powered probs p(token)^(1/temp) for each top-K token; length K array
     """
     device = p.device
-    tokenizer = p.tokenizer
     input_ids = torch.tensor([context], dtype=torch.long, device=device)
-    output = p.model.generate(
-        input_ids=input_ids,
-        max_new_tokens=1,
-        do_sample=True,
-        temperature=1,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.eos_token_id,
-        return_dict_in_generate=True,
+    logits = p.model(input_ids).logits[0, -1, :]  # (vocab_size,)
 
-        # Dont need the scaled logits
-        output_scores=False,
-        output_logits=True,
-    )  
-
-    # unscaled_logits shape: (num_new_tokens, 1, vocab_size)
-    unscaled_logits = torch.stack(output.logits, dim=0)
-
-    top_indices = torch.topk(unscaled_logits.squeeze(1), k=K, dim=-1).indices.squeeze(0)
-    top_indices_3d = top_indices.view(1,1,K)
-    power_log_probs = (1/temp * torch.gather(F.log_softmax(unscaled_logits, dim=-1), -1, top_indices_3d)).view(-1)
+    log_probs = F.log_softmax(logits, dim=-1)
+    top_indices = torch.topk(logits, k=K, dim=-1).indices  # (K,)
+    power_log_probs = (1/temp) * log_probs[top_indices]
     power_probs = torch.exp(power_log_probs)
-    # top_indices shape: (K) — the token IDs
+
+    del logits, log_probs
     return top_indices, power_probs
 
 
@@ -148,59 +120,74 @@ def top_K_from_base(p : AutoregressiveSampler, context, K, temp):
 
 
 @torch.no_grad()
-def compute_xi(p: AutoregressiveSampler, context, test_token, temp, M, T):
+def compute_xi_batched(p: AutoregressiveSampler, context, top_tokens, temp, M, T):
     """
-    Estimate ζ(xt) via M rollouts from the base model conditioned on context + test_token.
-    Each rollout computes prod_{s>t} p(xs)^(1/temp - 1) along the sampled trajectory.
+    Estimate ζ(xt) for all K candidate tokens in a single batched generate call.
+    Runs K*M rollouts at once instead of K separate calls of M rollouts.
 
     :param p: Base model
     :type p: AutoregressiveSampler
     :param context: Token IDs for the current context (before test_token)
-    :param test_token: Candidate token xt to evaluate
+    :param top_tokens: Tensor of K candidate token IDs; shape (K,)
     :param temp: Alpha = 1/temp for power scaling
-    :param M: Number of rollouts for Monte Carlo estimate
+    :param M: Number of rollouts per candidate
     :param T: Total trajectory length (prompt + generation)
 
     Returns:
-    :xi: Monte Carlo estimate of ζ(xt), averaged over M rollouts; scalar tensor
-    :xi_loos: Leave-one-out estimates of ζ(xt), each excluding one rollout; shape (M,)
+    :xis: Mean ζ estimate for each candidate; shape (K,)
+    :xis_loos: Leave-one-out estimates for each candidate; shape (K, M)
     """
-    context = context +[test_token]
-
     device = p.device
     tokenizer = p.tokenizer
-    input_ids = torch.tensor([context], dtype=torch.long, device=device)
-    total = []
-    max_new_tokens = T - len(context)
-    for rollout in range(M):
-        c = len(context)
-        output = p.model.generate(
-            input_ids=input_ids,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=1,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.eos_token_id,
-            return_dict_in_generate=True,
+    K = top_tokens.shape[0]
 
-            # Dont need the scaled logits
-            output_scores=False,
-            output_logits=True,
-        )
+    # Build K*M input sequences: for each candidate token, M copies of context + token
+    # context_tensor: (1, ctx_len)
+    context_tensor = torch.tensor([context], dtype=torch.long, device=device)
+    ctx_len = context_tensor.shape[1]
 
-        tokens = output.sequences[0][c:]
-        unscaled_logits = torch.stack(output.logits, dim=0)
+    # top_tokens: (K,) -> (K, 1) -> repeat M along new dim -> (K*M, 1)
+    tokens_col = top_tokens.unsqueeze(1).repeat(1, M).reshape(K * M, 1)
 
-        idx = tokens.view(unscaled_logits.shape[0], 1, 1)
-        log_probs_power = ((1/temp-1) * torch.gather(F.log_softmax(unscaled_logits, dim=-1), -1, idx)).view(-1).sum()
-        probs_power = torch.exp(log_probs_power)
-        total += [probs_power]
+    # context repeated K*M times: (K*M, ctx_len)
+    context_expanded = context_tensor.expand(K * M, -1)
 
-    total_tensor = torch.stack(total)
-    xi = total_tensor.mean() 
-    # xi_loo = sum(total[:-1])/(M-1)
-    xi_loos = (total_tensor.sum()-total_tensor)/(M-1)
-    return xi, xi_loos
+    # input_ids: (K*M, ctx_len + 1)
+    input_ids = torch.cat([context_expanded, tokens_col], dim=1)
+    c = input_ids.shape[1]  # ctx_len + 1
+    max_new_tokens = T - c
+
+    output = p.model.generate(
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        temperature=1,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.eos_token_id,
+        return_dict_in_generate=True,
+        output_scores=False,
+        output_logits=True,
+    )
+
+    # sequences: (K*M, seq_len), logits: list of (K*M, vocab_size) tensors
+    tokens_generated = output.sequences[:, c:]  # (K*M, num_new_tokens)
+    unscaled_logits = torch.stack(output.logits, dim=0)  # (num_new_tokens, K*M, vocab_size)
+
+    log_softmax_logits = F.log_softmax(unscaled_logits, dim=-1)
+    idx = tokens_generated.t().unsqueeze(-1)  # (num_new_tokens, K*M, 1)
+    gathered = torch.gather(log_softmax_logits, -1, idx).squeeze(-1)  # (num_new_tokens, K*M)
+    log_probs_power = ((1/temp - 1) * gathered).sum(dim=0)  # (K*M,)
+    total_tensor = torch.exp(log_probs_power)
+
+    del output, unscaled_logits, log_softmax_logits, gathered
+
+    # Reshape to (K, M) — rows are candidates, columns are rollouts
+    total_matrix = total_tensor.reshape(K, M)
+
+    xis = total_matrix.mean(dim=1)  # (K,)
+    xis_loos = (total_matrix.sum(dim=1, keepdim=True) - total_matrix) / (M - 1)  # (K, M)
+
+    return xis, xis_loos
 
 
 
@@ -228,28 +215,15 @@ def scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K):
         total_input = prompt.copy()
 
     # All the way upto the last token which is sampled using low-temp
-    for t in range(T-1):
+    for t in tqdm(range(T-1), desc="Scalable power tokens", unit="tok"):
         # G is the set of promising candidates according to the base model
-        G, power_probs= top_K_from_base(p, total_input, K, temp)
-        xis = []
+        G, power_probs = top_K_from_base(p, total_input, K, temp)
 
-        # List of lists containing every loo for each x_t
-        xis_loos = []
-        
-        for token in G:
-            # token is xt and the xt's are everything in G. Need to find all the p^ for each xt and then sample from this
-            xi, xi_loos = compute_xi(p, total_input, token, temp, M, T+c)
-            xis += [xi]
-            xis_loos += [xi_loos]
+        # Batch all K candidates into a single generate call (K*M rollouts at once)
+        xis_tensor, xis_loo_matrix = compute_xi_batched(p, total_input, G, temp, M, T+c)
 
-        # probs_jk = get_jk(p, G, xis, xis_loo, temp)
-        
-        xis_tensor = torch.stack(xis)
-        unnorm_probs = power_probs*xis_tensor
-        probs_a_pow = unnorm_probs/ unnorm_probs.sum()
-
-        # xis_loo_matrix shape: (K, M) — each row is LOO estimates for one token across rollouts                                                                                                                             
-        xis_loo_matrix = torch.stack(xis_loos)  
+        unnorm_probs = power_probs * xis_tensor
+        probs_a_pow = unnorm_probs / unnorm_probs.sum()
 
         # Broadcast power_probs (K,) -> (K, 1) to multiply with (K, M)
         unnorm_loo = power_probs.unsqueeze(1) * xis_loo_matrix
@@ -258,17 +232,20 @@ def scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K):
         probs_a_pow_loo = unnorm_loo / unnorm_loo.sum(dim=0, keepdim=True)
 
         # Now sum all the rollouts: shape(K,)
-        probs_a_pow_loo_summed = probs_a_pow_loo.sum(dim =1)
+        probs_a_pow_loo_summed = probs_a_pow_loo.sum(dim=1)
 
         # Shape (K, )
-        probs_jk = M*probs_a_pow - ((M-1)/M) * probs_a_pow_loo_summed
+        probs_jk = M * probs_a_pow - ((M-1)/M) * probs_a_pow_loo_summed
 
-        probs_jk = probs_jk.clamp(min=0)                                                                                                                                                                         
+        probs_jk = probs_jk.clamp(min=0)
         probs_jk = probs_jk / probs_jk.sum()
 
         sampled_idx = torch.multinomial(probs_jk, 1).item()
         sampled_token = G[sampled_idx].item()
         total_input.append(sampled_token)
+
+        del G, power_probs, xis_tensor, unnorm_probs, probs_a_pow
+        del xis_loo_matrix, unnorm_loo, probs_a_pow_loo, probs_a_pow_loo_summed, probs_jk
 
     last_token = low_temp(p, total_input, temp).item()
     total_input.append(last_token)
