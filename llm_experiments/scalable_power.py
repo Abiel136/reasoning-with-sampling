@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import transformers
+from transformers.cache_utils import DynamicCache
 
 from grader_utils.parse_utils import parse_answer
 from constants import *
@@ -50,18 +51,18 @@ class AutoregressiveSampler:
 
 
 
-# returns probabilities (normed)
-def normalize(dist):
-    probs = F.softmax(dist, dim=-1)
-    return probs
+# # returns probabilities (normed)
+# def normalize(dist):
+#     probs = F.softmax(dist, dim=-1)
+#     return probs
 
-# returns sum of logits (product of distributions p*q)
-def dist_product(logit_p, logit_q):
-    return logit_p+logit_q
+# # returns sum of logits (product of distributions p*q)
+# def dist_product(logit_p, logit_q):
+#     return logit_p+logit_q
 
-# returns logit scaled by temp (temperature scaling p^(1/tau))
-def dist_temp_scale(logit_p, temp):
-    return logit_p * torch.tensor(1 / temp, dtype=logit_p.dtype, device=logit_p.device)
+# # returns logit scaled by temp (temperature scaling p^(1/tau))
+# def dist_temp_scale(logit_p, temp):
+#     return logit_p * torch.tensor(1 / temp, dtype=logit_p.dtype, device=logit_p.device)
 
 # low-temperature sampling proposal distribution
 @torch.no_grad()
@@ -84,7 +85,7 @@ def low_temp(p : AutoregressiveSampler, context, temp):
     logits = p.model(input_ids).logits[0, -1, :]
     probs = F.softmax(logits / temp, dim=-1)
     token = torch.multinomial(probs, 1)
-    del logits, probs
+    del logits, probs, input_ids
     return token
 
 
@@ -114,7 +115,7 @@ def top_K_from_base(p : AutoregressiveSampler, context, K, temp):
     power_log_probs = (1/temp) * log_probs[top_indices]
     power_probs = torch.exp(power_log_probs)
 
-    del logits, log_probs
+    del logits, log_probs, output
     return top_indices, power_probs, past_kv
 
 
@@ -147,26 +148,27 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_tokens, temp, M, T
     # past_kv is a tuple of (key, value) per layer
     # Each key/value shape: (1, num_heads, seq_len, head_dim)
     # We need: (K*M, num_heads, seq_len, head_dim)
+                                  
+    # expanded_cache = DynamicCache()
+    # for layer_idx in range(len(past_kv)):
+    #     key = past_kv.key_cache[layer_idx].repeat(K * M, 1, 1, 1)
+    #     val = past_kv.value_cache[layer_idx].repeat(K * M, 1, 1, 1)
+    #     expanded_cache.update(key, val, layer_idx)
 
-    expanded_kv = []
-    for layer_kv in past_kv:
-        expanded_key = layer_kv[0].expand(K*M, -1, -1, -1)
-        expanded_val = layer_kv[1].expand(K*M, -1, -1, -1)
-        expanded_kv.append((expanded_key, expanded_val))
-    expanded_kv = tuple(expanded_kv)
+    expanded_kv = past_kv.batch_repeat_interleave(K * M)
 
     # --- Only feed the single candidate token per sequence ---
     # tokens_col: (K*M, 1)
     tokens_col = top_tokens.unsqueeze(-1).repeat(1,M).reshape(K*M, 1)
 
     # input_ids: (K*M, ctx_len + 1)
-    ctx_len = past_kv[0][0].shape(2)
+    ctx_len = past_kv.get_seq_length()
     c = ctx_len +1  # ctx_len + 1
     max_new_tokens = T - c
 
     output = p.model.generate(
-        input_ids=token_cols,
-        past_key_values = expanded_kv
+        input_ids=tokens_col,
+        past_key_values = expanded_kv,
         max_new_tokens=max_new_tokens,
         do_sample=True,
         temperature=1,
@@ -177,6 +179,13 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_tokens, temp, M, T
         output_logits=True,
     )
 
+
+    # print("input shape:", tokens_col.shape)
+    # print("output sequences shape:", output.sequences.shape)
+    # print("num logits:", len(output.logits))
+
+    #  num_new = len(output.logits)
+
     # sequences: (K*M, seq_len), logits: list of (K*M, vocab_size) tensors
     tokens_generated = output.sequences[:, 1:]  # (K*M, num_new_tokens)
     unscaled_logits = torch.stack(output.logits, dim=0)  # (num_new_tokens, K*M, vocab_size)
@@ -184,10 +193,21 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_tokens, temp, M, T
     log_softmax_logits = F.log_softmax(unscaled_logits, dim=-1)
     idx = tokens_generated.t().unsqueeze(-1)  # (num_new_tokens, K*M, 1)
     gathered = torch.gather(log_softmax_logits, -1, idx).squeeze(-1)  # (num_new_tokens, K*M)
-    log_probs_power = ((1/temp - 1) * gathered).sum(dim=0)  # (K*M,)
+
+
+    # Need to ensure that all EoS tokens are not summed
+    eos_id = tokenizer.eos_token_id
+    is_eos = (tokens_generated.t() == eos_id)
+    cumulative_eos = is_eos.cumsum(dim=0)
+    # Valid = no EOS seen yet, OR this is the first EOS
+    valid_mask = (cumulative_eos == 0) | (cumulative_eos == 1) & is_eos
+    masked_gathered = gathered * valid_mask.float()
+
+    log_probs_power = ((1/temp - 1) * masked_gathered).sum(dim=0)  # (K*M,)
     total_tensor = torch.exp(log_probs_power)
 
-    del output, unscaled_logits, log_softmax_logits, gathered
+    del output, unscaled_logits, log_softmax_logits, gathered, idx
+    del eos_id, is_eos, cumulative_eos, valid_mask, masked_gathered
 
     # Reshape to (K, M) — rows are candidates, columns are rollouts
     total_matrix = total_tensor.reshape(K, M)
@@ -234,6 +254,9 @@ def scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K):
         unnorm_probs = power_probs * xis_tensor
         probs_a_pow = unnorm_probs / unnorm_probs.sum()
 
+        print("power_probs:", power_probs)                                                                                                                                                                                   
+        print("xis_tensor:", xis_tensor)
+        print("unnorm_probs:", unnorm_probs)   
         # Broadcast power_probs (K,) -> (K, 1) to multiply with (K, M)
         unnorm_loo = power_probs.unsqueeze(1) * xis_loo_matrix
 
@@ -249,15 +272,26 @@ def scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K):
         probs_jk = probs_jk.clamp(min=0)
         probs_jk = probs_jk / probs_jk.sum()
 
+        print("probs_jk:", probs_jk)                                                                                                                                                                                         
+        print("any nan:", torch.isnan(probs_jk).any())
+        print("sum:", probs_jk.sum())
+
         sampled_idx = torch.multinomial(probs_jk, 1).item()
         sampled_token = G[sampled_idx].item()
         total_input.append(sampled_token)
 
+        if sampled_token == p.tokenizer.eos_token_id:
+            break
+
         del G, power_probs, xis_tensor, unnorm_probs, probs_a_pow
         del xis_loo_matrix, unnorm_loo, probs_a_pow_loo, probs_a_pow_loo_summed, probs_jk
 
-    last_token = low_temp(p, total_input, temp).item()
-    total_input.append(last_token)
+    
+    # Don't do final sampling if eos. 
+    if total_input[-1] != p.tokenizer.eos_token_id:
+        last_token = low_temp(p, total_input, temp).item()
+        total_input.append(last_token)
+
 
 
     if p.tokenizer.eos_token_id in total_input:
