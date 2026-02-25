@@ -105,7 +105,9 @@ def top_K_from_base(p : AutoregressiveSampler, context, K, temp):
     """
     device = p.device
     input_ids = torch.tensor([context], dtype=torch.long, device=device)
-    logits = p.model(input_ids).logits[0, -1, :]  # (vocab_size,)
+    output = p.model(input_ids, use_cache = True) # get the cache
+    logits = output.logits[0, -1, :]  # (vocab_size,)
+    past_kv = output.past_key_values
 
     log_probs = F.log_softmax(logits, dim=-1)
     top_indices = torch.topk(logits, k=K, dim=-1).indices  # (K,)
@@ -113,14 +115,14 @@ def top_K_from_base(p : AutoregressiveSampler, context, K, temp):
     power_probs = torch.exp(power_log_probs)
 
     del logits, log_probs
-    return top_indices, power_probs
+    return top_indices, power_probs, past_kv
 
 
 
 
 
 @torch.no_grad()
-def compute_xi_batched(p: AutoregressiveSampler, context, top_tokens, temp, M, T):
+def compute_xi_batched(p: AutoregressiveSampler, context, top_tokens, temp, M, T, past_kv):
     """
     Estimate ζ(xt) for all K candidate tokens in a single batched generate call.
     Runs K*M rollouts at once instead of K separate calls of M rollouts.
@@ -141,24 +143,30 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_tokens, temp, M, T
     tokenizer = p.tokenizer
     K = top_tokens.shape[0]
 
-    # Build K*M input sequences: for each candidate token, M copies of context + token
-    # context_tensor: (1, ctx_len)
-    context_tensor = torch.tensor([context], dtype=torch.long, device=device)
-    ctx_len = context_tensor.shape[1]
+    # --- Expand the KV cache from batch=1 to batch=K*M ---
+    # past_kv is a tuple of (key, value) per layer
+    # Each key/value shape: (1, num_heads, seq_len, head_dim)
+    # We need: (K*M, num_heads, seq_len, head_dim)
 
-    # top_tokens: (K,) -> (K, 1) -> repeat M along new dim -> (K*M, 1)
-    tokens_col = top_tokens.unsqueeze(1).repeat(1, M).reshape(K * M, 1)
+    expanded_kv = []
+    for layer_kv in past_kv:
+        expanded_key = layer_kv[0].expand(K*M, -1, -1, -1)
+        expanded_val = layer_kv[1].expand(K*M, -1, -1, -1)
+        expanded_kv.append((expanded_key, expanded_val))
+    expanded_kv = tuple(expanded_kv)
 
-    # context repeated K*M times: (K*M, ctx_len)
-    context_expanded = context_tensor.expand(K * M, -1)
+    # --- Only feed the single candidate token per sequence ---
+    # tokens_col: (K*M, 1)
+    tokens_col = top_tokens.unsqueeze(-1).repeat(1,M).reshape(K*M, 1)
 
     # input_ids: (K*M, ctx_len + 1)
-    input_ids = torch.cat([context_expanded, tokens_col], dim=1)
-    c = input_ids.shape[1]  # ctx_len + 1
+    ctx_len = past_kv[0][0].shape(2)
+    c = ctx_len +1  # ctx_len + 1
     max_new_tokens = T - c
 
     output = p.model.generate(
-        input_ids=input_ids,
+        input_ids=token_cols,
+        past_key_values = expanded_kv
         max_new_tokens=max_new_tokens,
         do_sample=True,
         temperature=1,
@@ -170,7 +178,7 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_tokens, temp, M, T
     )
 
     # sequences: (K*M, seq_len), logits: list of (K*M, vocab_size) tensors
-    tokens_generated = output.sequences[:, c:]  # (K*M, num_new_tokens)
+    tokens_generated = output.sequences[:, 1:]  # (K*M, num_new_tokens)
     unscaled_logits = torch.stack(output.logits, dim=0)  # (num_new_tokens, K*M, vocab_size)
 
     log_softmax_logits = F.log_softmax(unscaled_logits, dim=-1)
@@ -217,10 +225,11 @@ def scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K):
     # All the way upto the last token which is sampled using low-temp
     for t in tqdm(range(T-1), desc="Scalable power tokens", unit="tok"):
         # G is the set of promising candidates according to the base model
-        G, power_probs = top_K_from_base(p, total_input, K, temp)
+        G, power_probs, past_kv = top_K_from_base(p, total_input, K, temp)
 
         # Batch all K candidates into a single generate call (K*M rollouts at once)
-        xis_tensor, xis_loo_matrix = compute_xi_batched(p, total_input, G, temp, M, T+c)
+        xis_tensor, xis_loo_matrix = compute_xi_batched(p, total_input, G, temp, M, T+c, past_kv)
+        del past_kv
 
         unnorm_probs = power_probs * xis_tensor
         probs_a_pow = unnorm_probs / unnorm_probs.sum()
