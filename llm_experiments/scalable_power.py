@@ -173,9 +173,14 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_tokens, temp, M, T
             )
         chunk_tokens = tokens_col[start:end]
 
+        # Explicitly set cache_position so generate() knows the new token
+        # is at position ctx_len (right after the cached prefix)
+        cache_position = torch.tensor([ctx_len], dtype=torch.long, device=device)
+
         output = p.model.generate(
             input_ids=chunk_tokens,
             past_key_values=expanded_kv,
+            cache_position=cache_position,
             max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=1,
