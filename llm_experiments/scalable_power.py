@@ -123,10 +123,10 @@ def top_K_from_base(p : AutoregressiveSampler, context, K, temp):
 
 
 @torch.no_grad()
-def compute_xi_batched(p: AutoregressiveSampler, context, top_tokens, temp, M, T, past_kv):
+def compute_xi_batched(p: AutoregressiveSampler, context, top_tokens, temp, M, T, past_kv, batch_size=None):
     """
     Estimate ζ(xt) for all K candidate tokens in a single batched generate call.
-    Runs K*M rollouts at once instead of K separate calls of M rollouts.
+    Runs K*M rollouts, optionally in mini-batches to reduce peak memory.
 
     :param p: Base model
     :type p: AutoregressiveSampler
@@ -135,6 +135,7 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_tokens, temp, M, T
     :param temp: Alpha = 1/temp for power scaling
     :param M: Number of rollouts per candidate
     :param T: Total trajectory length (prompt + generation)
+    :param batch_size: Max rollouts per mini-batch (default: K*M, i.e. no batching)
 
     Returns:
     :xis: Mean ζ estimate for each candidate; shape (K,)
@@ -143,71 +144,63 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_tokens, temp, M, T
     device = p.device
     tokenizer = p.tokenizer
     K = top_tokens.shape[0]
+    total_rollouts = K * M
 
-    # --- Expand the KV cache from batch=1 to batch=K*M ---
-    # past_kv is a tuple of (key, value) per layer
-    # Each key/value shape: (1, num_heads, seq_len, head_dim)
-    # We need: (K*M, num_heads, seq_len, head_dim)
-                                  
-    # expanded_cache = DynamicCache()
-    # for layer_idx in range(len(past_kv)):
-    #     key = past_kv.key_cache[layer_idx].repeat(K * M, 1, 1, 1)
-    #     val = past_kv.value_cache[layer_idx].repeat(K * M, 1, 1, 1)
-    #     expanded_cache.update(key, val, layer_idx)
+    if batch_size is None:
+        batch_size = total_rollouts
 
-    expanded_kv = past_kv.batch_repeat_interleave(K * M)
-
-    # --- Only feed the single candidate token per sequence ---
+    # All K*M input tokens: each candidate repeated M times
     # tokens_col: (K*M, 1)
-    tokens_col = top_tokens.unsqueeze(-1).repeat(1,M).reshape(K*M, 1)
+    tokens_col = top_tokens.unsqueeze(-1).repeat(1, M).reshape(total_rollouts, 1)
 
-    # input_ids: (K*M, ctx_len + 1)
     ctx_len = past_kv.get_seq_length()
-    c = ctx_len +1  # ctx_len + 1
+    c = ctx_len + 1
     max_new_tokens = T - c
 
-    output = p.model.generate(
-        input_ids=tokens_col,
-        past_key_values = expanded_kv,
-        max_new_tokens=max_new_tokens,
-        do_sample=True,
-        temperature=1,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.eos_token_id,
-        return_dict_in_generate=True,
-        output_scores=False,
-        output_logits=True,
-    )
+    # Process rollouts in mini-batches
+    log_probs_power_parts = []
+    for start in range(0, total_rollouts, batch_size):
+        end = min(start + batch_size, total_rollouts)
+        chunk_size = end - start
 
+        expanded_kv = past_kv.batch_repeat_interleave(chunk_size)
+        chunk_tokens = tokens_col[start:end]
 
-    # print("input shape:", tokens_col.shape)
-    # print("output sequences shape:", output.sequences.shape)
-    # print("num logits:", len(output.logits))
+        output = p.model.generate(
+            input_ids=chunk_tokens,
+            past_key_values=expanded_kv,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=1,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.eos_token_id,
+            return_dict_in_generate=True,
+            output_scores=False,
+            output_logits=True,
+        )
 
-    #  num_new = len(output.logits)
+        tokens_generated = output.sequences[:, 1:]  # (chunk_size, num_new_tokens)
+        unscaled_logits = torch.stack(output.logits, dim=0)  # (num_new_tokens, chunk_size, vocab_size)
 
-    # sequences: (K*M, seq_len), logits: list of (K*M, vocab_size) tensors
-    tokens_generated = output.sequences[:, 1:]  # (K*M, num_new_tokens)
-    unscaled_logits = torch.stack(output.logits, dim=0)  # (num_new_tokens, K*M, vocab_size)
+        log_softmax_logits = F.log_softmax(unscaled_logits, dim=-1)
+        idx = tokens_generated.t().unsqueeze(-1)  # (num_new_tokens, chunk_size, 1)
+        gathered = torch.gather(log_softmax_logits, -1, idx).squeeze(-1)  # (num_new_tokens, chunk_size)
 
-    log_softmax_logits = F.log_softmax(unscaled_logits, dim=-1)
-    idx = tokens_generated.t().unsqueeze(-1)  # (num_new_tokens, K*M, 1)
-    gathered = torch.gather(log_softmax_logits, -1, idx).squeeze(-1)  # (num_new_tokens, K*M)
+        # Mask out tokens after EOS
+        eos_id = tokenizer.eos_token_id
+        is_eos = (tokens_generated.t() == eos_id)
+        cumulative_eos = is_eos.cumsum(dim=0)
+        valid_mask = (cumulative_eos == 0) | (cumulative_eos == 1) & is_eos
+        masked_gathered = gathered * valid_mask.float()
 
+        chunk_log_probs = ((1/temp - 1) * masked_gathered).sum(dim=0)  # (chunk_size,)
+        log_probs_power_parts.append(chunk_log_probs)
 
-    # Need to ensure that all EoS tokens are not summed
-    eos_id = tokenizer.eos_token_id
-    is_eos = (tokens_generated.t() == eos_id)
-    cumulative_eos = is_eos.cumsum(dim=0)
-    # Valid = no EOS seen yet, OR this is the first EOS
-    valid_mask = (cumulative_eos == 0) | (cumulative_eos == 1) & is_eos
-    masked_gathered = gathered * valid_mask.float()
+        del output, unscaled_logits, log_softmax_logits, gathered, idx
+        del is_eos, cumulative_eos, valid_mask, masked_gathered, expanded_kv
 
-    log_probs_power = ((1/temp - 1) * masked_gathered).sum(dim=0)  # (K*M,)
+    log_probs_power = torch.cat(log_probs_power_parts, dim=0)  # (K*M,)
     total_tensor = torch.exp(log_probs_power)
-
-    del output, unscaled_logits, log_softmax_logits, gathered, idx
-    del eos_id, is_eos, cumulative_eos, valid_mask, masked_gathered
 
     # Reshape to (K, M) — rows are candidates, columns are rollouts
     total_matrix = total_tensor.reshape(K, M)
@@ -222,7 +215,7 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_tokens, temp, M, T
 
 # power sampling using lookahead approximations
 @torch.no_grad()
-def scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K):
+def scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K, batch_size=None):
     """
     Main loop for sampling
     
@@ -248,7 +241,7 @@ def scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K):
         G, power_probs, past_kv = top_K_from_base(p, total_input, K, temp)
 
         # Batch all K candidates into a single generate call (K*M rollouts at once)
-        xis_tensor, xis_loo_matrix = compute_xi_batched(p, total_input, G, temp, M, T+c, past_kv)
+        xis_tensor, xis_loo_matrix = compute_xi_batched(p, total_input, G, temp, M, T+c, past_kv, batch_size=batch_size)
         del past_kv
 
         unnorm_probs = power_probs * xis_tensor

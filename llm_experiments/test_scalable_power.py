@@ -29,6 +29,7 @@ if __name__ == "__main__":
     parser.add_argument("--M", action="store", type=int, default=3, help="Number of rollouts for xi estimation")
     parser.add_argument("--T", action="store", type=int, default=20, help="Trajectory length (number of new tokens)")
     parser.add_argument("--K", action="store", type=int, default=5, help="Top-K candidates from base model")
+    parser.add_argument("--batch_size", action="store", type=int, default=5, help="Mini-batch size for rollouts (reduces peak GPU memory)")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -112,7 +113,7 @@ if __name__ == "__main__":
         print(f"Naive temp: {naive_completion}")
 
         # 3. Scalable power sampling
-        scalable_output = scalable_power_samp(autoreg_sampler, prefx, temp, M, T, K)
+        scalable_output = scalable_power_samp(autoreg_sampler, prefx, temp, M, T, K, batch_size=args.batch_size)
         scalable_ids = torch.tensor(scalable_output, dtype=torch.long, device=device).to("cpu")
         # Strip the prompt prefix to get only generated tokens
         scalable_generated_ids = scalable_ids[len(prefx):]
