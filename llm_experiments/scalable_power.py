@@ -1,5 +1,4 @@
 import os
-import copy
 from contextlib import nullcontext
 from glob import glob
 import json
@@ -163,8 +162,14 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_tokens, temp, M, T
         end = min(start + batch_size, total_rollouts)
         chunk_size = end - start
 
-        expanded_kv = copy.deepcopy(past_kv)
-        expanded_kv.batch_repeat_interleave(chunk_size)
+        expanded_kv = DynamicCache()
+        for layer_idx in range(len(past_kv)):
+            key, value = past_kv[layer_idx]
+            expanded_kv.update(
+                key.repeat_interleave(chunk_size, dim=0),
+                value.repeat_interleave(chunk_size, dim=0),
+                layer_idx,
+            )
         chunk_tokens = tokens_col[start:end]
 
         output = p.model.generate(
