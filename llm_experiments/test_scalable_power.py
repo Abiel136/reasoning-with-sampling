@@ -92,26 +92,33 @@ if __name__ == "__main__":
         input_ids = tokenizer.encode(input_text, return_tensors="pt").to(device)
         prefx = [idx.item() for idx in input_ids[0]]
 
+        import time
+
         # 1. Standard sampling (baseline)
+        t0 = time.time()
         std_output = hf_model.generate(
             input_ids, max_new_tokens=max_tokens,
             return_dict_in_generate=True, output_scores=True,
             do_sample=True
         )
+        std_time = time.time() - t0
         std_generated_ids = std_output[0][:, len(input_ids[0]):].squeeze().to("cpu")
         std_completion = tokenizer.decode(std_generated_ids, skip_special_tokens=True)
-        print(f"Standard: {std_completion}")
+        std_ntokens = std_generated_ids.shape[0] if std_generated_ids.dim() > 0 else 1
+        print(f"Standard ({std_ntokens} tokens, {std_time:.2f}s, {std_ntokens/std_time:.1f} tok/s): {std_completion}", flush=True)
 
         # 2. Naive low-temp sampling (baseline)
+        t0 = time.time()
         naive_output = hf_model.generate(
             input_ids, max_new_tokens=max_tokens,
             return_dict_in_generate=True, output_scores=True,
             do_sample=True, temperature=temp
         )
-        
+        naive_time = time.time() - t0
         naive_generated_ids = naive_output[0][:, len(input_ids[0]):].squeeze().to("cpu")
         naive_completion = tokenizer.decode(naive_generated_ids, skip_special_tokens=True)
-        print(f"Naive temp: {naive_completion}")
+        naive_ntokens = naive_generated_ids.shape[0] if naive_generated_ids.dim() > 0 else 1
+        print(f"Naive temp ({naive_ntokens} tokens, {naive_time:.2f}s, {naive_ntokens/naive_time:.1f} tok/s): {naive_completion}", flush=True)
 
         del std_output, naive_output
         torch.cuda.empty_cache()
