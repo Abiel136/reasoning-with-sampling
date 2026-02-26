@@ -164,8 +164,8 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_tokens, temp, M, T
 
         expanded_kv = DynamicCache()
         for layer_idx in range(len(past_kv)):
-            key = past_kv.key_cache[layer_idx]
-            value = past_kv.value_cache[layer_idx]
+            key = past_kv.layers[layer_idx].keys
+            value = past_kv.layers[layer_idx].values
             expanded_kv.update(
                 key.repeat_interleave(chunk_size, dim=0),
                 value.repeat_interleave(chunk_size, dim=0),
