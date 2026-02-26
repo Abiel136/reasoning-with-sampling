@@ -108,9 +108,13 @@ if __name__ == "__main__":
             return_dict_in_generate=True, output_scores=True,
             do_sample=True, temperature=temp
         )
+        
         naive_generated_ids = naive_output[0][:, len(input_ids[0]):].squeeze().to("cpu")
         naive_completion = tokenizer.decode(naive_generated_ids, skip_special_tokens=True)
         print(f"Naive temp: {naive_completion}")
+
+        del std_output, naive_output
+        torch.cuda.empty_cache()
 
         # 3. Scalable power sampling
         scalable_output = scalable_power_samp(autoreg_sampler, prefx, temp, M, T, K, batch_size=args.batch_size)

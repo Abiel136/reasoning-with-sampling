@@ -1,52 +1,12 @@
 [
     {
-        "prompt": "What is 2 + 3?",
-        "answer": "5",
-        "type": "math"
-    },
-    {
         "prompt": "What is 7 * 8?",
         "answer": "56",
         "type": "math"
     },
     {
-        "prompt": "What is 15 - 9?",
-        "answer": "6",
-        "type": "math"
-    },
-    {
-        "prompt": "What is 100 / 4?",
-        "answer": "25",
-        "type": "math"
-    },
-    {
-        "prompt": "What is 3^2 + 4^2?",
-        "answer": "25",
-        "type": "math"
-    },
-    {
-        "prompt": "Explain in one sentence why the sky appears blue.",
-        "answer": "The sky appears blue because shorter blue wavelengths of sunlight are scattered more by the atmosphere than other colors.",
-        "type": "english"
-    },
-    {
-        "prompt": "Write a sentence using the word 'ephemeral'.",
-        "answer": "The beauty of the sunset was ephemeral, lasting only a few fleeting minutes.",
-        "type": "english"
-    },
-    {
         "prompt": "In one sentence, explain the difference between 'affect' and 'effect'.",
         "answer": "Affect is typically a verb meaning to influence, while effect is typically a noun meaning the result of a change.",
-        "type": "english"
-    },
-    {
-        "prompt": "Summarize the concept of gravity in one sentence.",
-        "answer": "Gravity is a fundamental force that attracts objects with mass toward each other.",
-        "type": "english"
-    },
-    {
-        "prompt": "Write a short sentence that contains a metaphor.",
-        "answer": "Time is a thief that steals our youth.",
         "type": "english"
     }
 ]

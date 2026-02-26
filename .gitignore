@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.err
+*.out
+results/
+.python-version
+runner.txt

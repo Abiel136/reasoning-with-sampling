@@ -244,17 +244,32 @@ def scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K, batch_
         xis_tensor, xis_loo_matrix = compute_xi_batched(p, total_input, G, temp, M, T+c, past_kv, batch_size=batch_size)
         del past_kv
 
-        unnorm_probs = power_probs * xis_tensor
-        probs_a_pow = unnorm_probs / unnorm_probs.sum()
+        # unnorm_probs = power_probs * xis_tensor
+        # probs_a_pow = unnorm_probs / unnorm_probs.sum()
 
-        print("power_probs:", power_probs)                                                                                                                                                                                   
-        print("xis_tensor:", xis_tensor)
-        print("unnorm_probs:", unnorm_probs)   
+
+        # Work in log space due to instabilities
+        log_unnorm = torch.log(power_probs.float()) + torch.log(xis_tensor + 1e-45)
+        log_probs_a_pow = log_unnorm - torch.logsumexp(log_unnorm, dim=0)
+        probs_a_pow = torch.exp(log_probs_a_pow)
+
+        # print(f"---- Token {t} -----")
+        # print("power_probs:", power_probs)                                                                                                                                                                                   
+        # print("xis_tensor:", xis_tensor)
+        # print("probs_a_power:", probs_a_pow)   
+
+
         # Broadcast power_probs (K,) -> (K, 1) to multiply with (K, M)
-        unnorm_loo = power_probs.unsqueeze(1) * xis_loo_matrix
 
-        # Normalize over tokens (dim=0) for each rollout s; shape: (K, M)
-        probs_a_pow_loo = unnorm_loo / unnorm_loo.sum(dim=0, keepdim=True)
+        # unnorm_loo = power_probs.unsqueeze(1) * xis_loo_matrix
+
+        # # Normalize over tokens (dim=0) for each rollout s; shape: (K, M)
+        # probs_a_pow_loo = unnorm_loo / unnorm_loo.sum(dim=0, keepdim=True)
+
+        log_unnorm_loo = torch.log(power_probs.float()).unsqueeze(1) + torch.log(xis_loo_matrix + 1e-45)
+        log_probs_loo = log_unnorm_loo - torch.logsumexp(log_unnorm_loo, dim=0, keepdim=True)
+        probs_a_pow_loo = torch.exp(log_probs_loo)
+
 
         # Now sum all the rollouts: shape(K,)
         probs_a_pow_loo_summed = probs_a_pow_loo.sum(dim=1)
@@ -265,9 +280,12 @@ def scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K, batch_
         probs_jk = probs_jk.clamp(min=0)
         probs_jk = probs_jk / probs_jk.sum()
 
-        print("probs_jk:", probs_jk)                                                                                                                                                                                         
-        print("any nan:", torch.isnan(probs_jk).any())
-        print("sum:", probs_jk.sum())
+        # print("probs_jk: ", probs_jk)    
+        # print(" ")                    
+
+
+        # print("any nan:", torch.isnan(probs_jk).any())
+        # print("sum:", probs_jk.sum())
 
         sampled_idx = torch.multinomial(probs_jk, 1).item()
         sampled_token = G[sampled_idx].item()
@@ -276,8 +294,8 @@ def scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K, batch_
         if sampled_token == p.tokenizer.eos_token_id:
             break
 
-        del G, power_probs, xis_tensor, unnorm_probs, probs_a_pow
-        del xis_loo_matrix, unnorm_loo, probs_a_pow_loo, probs_a_pow_loo_summed, probs_jk
+        del G, power_probs, xis_tensor, probs_a_pow
+        del xis_loo_matrix, probs_a_pow_loo, probs_a_pow_loo_summed, probs_jk
 
     
     # Don't do final sampling if eos. 
