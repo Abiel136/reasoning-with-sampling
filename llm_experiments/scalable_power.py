@@ -157,11 +157,14 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_tokens, temp, M, T
     max_new_tokens = T - c
 
     # Process rollouts in mini-batches
+    import time
     log_probs_power_parts = []
     for start in range(0, total_rollouts, batch_size):
         end = min(start + batch_size, total_rollouts)
         chunk_size = end - start
+        print(f"    [DEBUG] chunk {start}-{end} (size={chunk_size})")
 
+        t0 = time.time()
         expanded_kv = DynamicCache()
         for layer_idx in range(len(past_kv)):
             key = past_kv.layers[layer_idx].keys
@@ -171,12 +174,16 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_tokens, temp, M, T
                 value.repeat_interleave(chunk_size, dim=0),
                 layer_idx,
             )
+        print(f"    [DEBUG] KV expand: {time.time()-t0:.2f}s | expanded seq_len={expanded_kv.get_seq_length()}, layers={len(expanded_kv)}")
+
         chunk_tokens = tokens_col[start:end]
 
         # Explicitly set cache_position so generate() knows the new token
         # is at position ctx_len (right after the cached prefix)
         cache_position = torch.tensor([ctx_len], dtype=torch.long, device=device)
 
+        t0 = time.time()
+        print(f"    [DEBUG] Starting generate: input_ids={chunk_tokens.shape}, max_new_tokens={max_new_tokens}, cache_position={cache_position}")
         output = p.model.generate(
             input_ids=chunk_tokens,
             past_key_values=expanded_kv,
@@ -190,6 +197,7 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_tokens, temp, M, T
             output_scores=False,
             output_logits=True,
         )
+        print(f"    [DEBUG] generate done: {time.time()-t0:.2f}s | output seq_len={output.sequences.shape}")
 
         tokens_generated = output.sequences[:, 1:]  # (chunk_size, num_new_tokens)
         unscaled_logits = torch.stack(output.logits, dim=0)  # (num_new_tokens, chunk_size, vocab_size)
@@ -249,11 +257,17 @@ def scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K, batch_
 
     # All the way upto the last token which is sampled using low-temp
     for t in tqdm(range(T-1), desc="Scalable power tokens", unit="tok"):
+        import time
+
         # G is the set of promising candidates according to the base model
+        t0 = time.time()
         G, power_probs, past_kv = top_K_from_base(p, total_input, K, temp)
+        print(f"  [DEBUG] top_K_from_base: {time.time()-t0:.2f}s | ctx_len={len(total_input)}, K={K}")
 
         # Batch all K candidates into a single generate call (K*M rollouts at once)
+        t0 = time.time()
         xis_tensor, xis_loo_matrix = compute_xi_batched(p, total_input, G, temp, M, T+c, past_kv, batch_size=batch_size)
+        print(f"  [DEBUG] compute_xi_batched: {time.time()-t0:.2f}s | total_rollouts={K*M}, batch_size={batch_size}")
         del past_kv
 
         # unnorm_probs = power_probs * xis_tensor
