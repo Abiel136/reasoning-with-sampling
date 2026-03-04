@@ -267,7 +267,8 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_blocks, temp, M, T
 
     ctx_len = past_kv.get_seq_length()
     c = ctx_len + block_size  # Context length + sampled block
-    max_new_tokens = T - c
+    
+    # max_new_tokens = T - c
     # max_new_tokens = H
 
     # Process rollouts in mini-batches
@@ -300,11 +301,12 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_blocks, temp, M, T
 
         chunk_blocks = expanded_blocks[start:end]  # (chunk_size, block_size)
 
-        # Cache position for the first token of the block
-        cache_position = torch.tensor([ctx_len], dtype=torch.long, device=device)
+        # Cache position must cover all block_size tokens: [ctx_len, ctx_len+1, ..., ctx_len+block_size-1]
+        # A scalar (single position) would give wrong positional encodings for every token after the first.
+        cache_position = torch.arange(ctx_len, ctx_len + block_size, dtype=torch.long, device=device)
 
         t0 = time.time()
-        _dbg(f"Starting generate: input_ids={chunk_blocks.shape}, max_new_tokens={max_new_tokens}, cache_position={cache_position}")
+        _dbg(f"Starting generate: input_ids={chunk_blocks.shape}, max_new_tokens={H}, cache_position={cache_position}")
         output = p.model.generate(
             input_ids=chunk_blocks,
             past_key_values=expanded_kv,
@@ -322,6 +324,15 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_blocks, temp, M, T
 
         # Tokens generated after the block: shape (chunk_size, num_new_tokens)
         tokens_generated = output.sequences[:, block_size:]
+        num_new_tokens = tokens_generated.shape[1]
+
+        # Sanity check: output.logits must have exactly one entry per generated token.
+        # If this fails, the block_size slice is misaligned with what generate() returned.
+        assert len(output.logits) == num_new_tokens, (
+            f"Logit/token mismatch: got {len(output.logits)} logit steps "
+            f"but {num_new_tokens} generated tokens. "
+            f"output.sequences.shape={output.sequences.shape}, block_size={block_size}"
+        )
         unscaled_logits = torch.stack(output.logits, dim=0)  # (num_new_tokens, chunk_size, vocab_size)
 
         log_softmax_logits = F.log_softmax(unscaled_logits, dim=-1)
