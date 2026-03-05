@@ -21,7 +21,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", action="store", default="qwen_math", type=str,
                         choices=["qwen", "qwen_math", "phi", "tulu", "qwen_math_grpo", "phi_grpo"])
     parser.add_argument("--temperature", action="store", default=0.25, type=float, dest="temperature")
-    parser.add_argument("--cot", action="store_true", type=bool, default=True)
+    parser.add_argument("--cot", action="store_true", default=True)
     parser.add_argument("--device", action="store", type=str, dest="device",
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", action="store", type=int, default=0)
@@ -34,7 +34,7 @@ if __name__ == "__main__":
     parser.add_argument("--H", action="store", type=int, default=20, help="Number of candidate blocks sampled from base model")
     parser.add_argument("--block_size", action="store", type=int, default=20, help="Number of candidate blocks sampled from base model")
     parser.add_argument("--batch_size", action="store", type=int, default=0, help="Mini-batch size for rollouts (reduces peak GPU memory)")
-    parser.add_argument("--batched_sampling", action = "store_true", type = bool, default = True)
+    parser.add_argument("--batched_sampling", action = "store_true", default = True)
     args = parser.parse_args()
 
     random.seed(args.seed)

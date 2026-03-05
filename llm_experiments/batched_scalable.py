@@ -474,8 +474,8 @@ def batched_scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K
     
     # Generate the remainder block: q+1 = T - B*floor(T/B) + 1 tokens.
     # Skip if EOS was already hit in the full-blocks loop.
-    remainder_block_size = remainder + 1
-    if total_input[-1] != p.tokenizer.eos_token_id:
+    if remainder > 0 and total_input[-1] != p.tokenizer.eos_token_id:
+        remainder_block_size = remainder
         t0 = time.time()
         dbg(f"Before remainder block | remainder_size={remainder_block_size} | GPU: {gpu_mem()}")
         sampled_rem_block = sample_remainder_block(p, total_input, temp, L, remainder_block_size)
