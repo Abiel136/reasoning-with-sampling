@@ -357,18 +357,22 @@ def scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K, batch_
 
 def format_prompt(question, model, tokenizer, cot=True):
     if model == "qwen":
-        format_str = PROMPT + question
+        content_str = PROMPT + question
         if cot:
-            format_str+=COT
+            content_str += COT
         else:
-            format_str+=BASE
+            content_str += BASE
+        answer_context = [{"role": "user", "content": content_str}]
+        format_str = tokenizer.apply_chat_template(answer_context, tokenize=False, add_generation_prompt=True)
 
     elif model == "qwen_math":
-        format_str = PROMPT + question
+        content_str = PROMPT + question
         if cot:
-            format_str+=COT
+            content_str += COT
         else:
-            format_str+=BASE
+            content_str += BASE
+        answer_context = [{"role": "user", "content": content_str}]
+        format_str = tokenizer.apply_chat_template(answer_context, tokenize=False, add_generation_prompt=True)
 
     elif model == "qwen_math_grpo":
         content_str = PROMPT + question
