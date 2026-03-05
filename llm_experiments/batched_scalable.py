@@ -247,7 +247,7 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_blocks, temp, M, T
     :param T: Total trajectory length (for compute_xi_batched, this is typically T+c)
     :param past_kv: Cached key-values from the context for efficient generation
     :param H: rollout horizon length
-    :param batch_size: Max rollouts per mini-batch (default: K*M, i.e. no batching)
+    :param batch_size: Max rollouts per mini-batch (default: 0 ->  no batching)
 
     Returns:
     :xis: Mean ζ estimate for each candidate block; shape (K,)
@@ -259,7 +259,7 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_blocks, temp, M, T
     block_size = top_blocks.shape[1]
     total_rollouts = K * M
 
-    if batch_size is None:
+    if batch_size == 0:
         batch_size = total_rollouts
 
     # Expand each block M times: shape (K*M, block_size)
@@ -369,7 +369,7 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_blocks, temp, M, T
 
 # power sampling using lookahead approximations
 @torch.no_grad()
-def scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K, L, block_size, H, batch_size_xi=None):
+def batched_scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K, L, block_size, H, batch_size_xi=0):
     """
     Main loop for sampling. Each iteration samples a block of tokens. 
     

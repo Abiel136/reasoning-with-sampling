@@ -11,6 +11,7 @@ import torch
 import transformers
 
 from scalable_power import AutoregressiveSampler, scalable_power_samp, format_prompt
+from batched_scalable import batched_scalable_power_samp
 from constants import *
 
 
@@ -20,7 +21,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", action="store", default="qwen_math", type=str,
                         choices=["qwen", "qwen_math", "phi", "tulu", "qwen_math_grpo", "phi_grpo"])
     parser.add_argument("--temperature", action="store", default=0.25, type=float, dest="temperature")
-    parser.add_argument("--cot", action="store", type=bool, default=True)
+    parser.add_argument("--cot", action="store_true", type=bool, default=True)
     parser.add_argument("--device", action="store", type=str, dest="device",
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", action="store", type=int, default=0)
@@ -29,7 +30,11 @@ if __name__ == "__main__":
     parser.add_argument("--M", action="store", type=int, default=3, help="Number of rollouts for xi estimation")
     parser.add_argument("--T", action="store", type=int, default=20, help="Trajectory length (number of new tokens)")
     parser.add_argument("--K", action="store", type=int, default=5, help="Top-K candidates from base model")
-    parser.add_argument("--batch_size", action="store", type=int, default=5, help="Mini-batch size for rollouts (reduces peak GPU memory)")
+    parser.add_argument("--L", action="store", type=int, default=12, help="Number of candidate blocks sampled from base model")
+    parser.add_argument("--H", action="store", type=int, default=20, help="Number of candidate blocks sampled from base model")
+    parser.add_argument("--block_size", action="store", type=int, default=20, help="Number of candidate blocks sampled from base model")
+    parser.add_argument("--batch_size", action="store", type=int, default=0, help="Mini-batch size for rollouts (reduces peak GPU memory)")
+    parser.add_argument("--batched_sampling", action = "store_true", type = bool, default = True)
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -42,6 +47,10 @@ if __name__ == "__main__":
     M = args.M
     T = args.T
     K = args.K
+    L = args.L
+    H = args.H
+    block_size = args.block_size
+    batch_size = args.batch_size
 
     save_str = os.path.join(args.save_str, model)
     os.makedirs(save_str, exist_ok=True)
@@ -124,7 +133,11 @@ if __name__ == "__main__":
         torch.cuda.empty_cache()
 
         # 3. Scalable power sampling
-        scalable_output = scalable_power_samp(autoreg_sampler, prefx, temp, M, T, K, batch_size=args.batch_size)
+        if args.batched_sampling:
+            scalable_output = batched_scalable_power_samp(autoreg_sampler, prefx, temp, M, T, K, L, block_size, H, batch_size)
+        else:
+            scalable_output = scalable_power_samp(autoreg_sampler, prefx, temp, M, T, K, batch_size)
+        
         scalable_ids = torch.tensor(scalable_output, dtype=torch.long, device=device).to("cpu")
         # Strip the prompt prefix to get only generated tokens
         scalable_generated_ids = scalable_ids[len(prefx):]
