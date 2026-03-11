@@ -233,10 +233,10 @@ def sample_remainder_block(p: AutoregressiveSampler, context, temp, L, remainder
 
 
 @torch.no_grad()
-def compute_xi_batched(p: AutoregressiveSampler, context, top_blocks, temp, M, T, past_kv, H, batch_size=None):
+def compute_xi_batched(p: AutoregressiveSampler, context, top_blocks, temp, M, T, past_kv, H, batch_size=None, debug=False):
     """
     Estimate ζ(block) for all K candidate blocks in batched generate calls.
-    For each of K blocks, run M rollouts to estimate lookahead value.
+    For each of K blocks, run M rollouts of length H to estimate lookahead value.
 
     :param p: Base model
     :type p: AutoregressiveSampler
@@ -248,6 +248,7 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_blocks, temp, M, T
     :param past_kv: Cached key-values from the context for efficient generation
     :param H: rollout horizon length
     :param batch_size: Max rollouts per mini-batch (default: 0 ->  no batching)
+    :param debug: None = silent | "verbose" = timing/memory info
 
     Returns:
     :xis: Mean ζ estimate for each candidate block; shape (K,)
@@ -267,18 +268,16 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_blocks, temp, M, T
 
     ctx_len = past_kv.get_seq_length()
     c = ctx_len + block_size  # Context length + sampled block
-    
-    # max_new_tokens = T - c
-    # max_new_tokens = H
 
     # Process rollouts in mini-batches
     import time
-    def _dbg(msg):
-        print(f"    [DEBUG] {msg}", flush=True)
     def _gpu():
-        alloc = torch.cuda.memory_allocated() / 1024**3
-        reserved = torch.cuda.memory_reserved() / 1024**3
-        return f"alloc={alloc:.2f}GB, reserved={reserved:.2f}GB"
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            return f"alloc={alloc:.2f}GB, reserved={reserved:.2f}GB"
+        return "n/a"
+    _dbg = (lambda msg: print(f"    [DEBUG] {msg}", flush=True)) if debug == "verbose" else (lambda msg: None)
 
     log_probs_power_parts = []
     for start in range(0, total_rollouts, batch_size):
@@ -369,14 +368,14 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_blocks, temp, M, T
 
 # power sampling using lookahead approximations
 @torch.no_grad()
-def batched_scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K, L, block_size, H, batch_size_xi=0):
+def batched_scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K, L, block_size, H, batch_size_xi=0, debug=None):
     """
-    Main loop for sampling. Each iteration samples a block of tokens. 
-    
+    Main loop for sampling. Each iteration samples a block of tokens.
+
     :param p: Base model
     :type p: AutoregressiveSampler
     :param prompt: Prompt added depending on dataset
-    :param temp: Alpha = 1/temp. 
+    :param temp: Alpha = 1/temp.
     :param M: Number of rollouts per candidate block
     :param T: Trajectory Length (total tokens to generate)
     :param K: Number of top candidate blocks to evaluate
@@ -384,6 +383,7 @@ def batched_scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K
     :param block_size: Number of tokens per block
     :param H: horizon length for rollouts
     :param batch_size_xi: Batches for computing rollouts (memory efficiency)
+    :param debug: None = silent | "verbose" = timing/memory info | "probs" = per-block probabilities
     """
 
     print(f'alpha: {1/temp}')
@@ -394,18 +394,18 @@ def batched_scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K
         total_input = prompt.copy()
 
     import time
-    import sys
-    def dbg(msg):
-        print(f"  [DEBUG] {msg}", flush=True)
     def gpu_mem():
-        alloc = torch.cuda.memory_allocated() / 1024**3
-        reserved = torch.cuda.memory_reserved() / 1024**3
-        return f"alloc={alloc:.2f}GB, reserved={reserved:.2f}GB"
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            return f"alloc={alloc:.2f}GB, reserved={reserved:.2f}GB"
+        return "n/a"
+    dbg = (lambda msg: print(f"  [DEBUG] {msg}", flush=True)) if debug == "verbose" else (lambda msg: None)
 
     # Compute number of full blocks and remainder
     num_full_blocks = T // block_size
     remainder = T % block_size
-    
+
     # Process full blocks
     for t in tqdm(range(num_full_blocks), desc="Scalable power blocks", unit="block"):
 
@@ -419,7 +419,7 @@ def batched_scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K
         # For each of the K candidate blocks, run M rollouts to estimate lookahead value ζ
         # This requires expanding the block dimension to K*M
         t0 = time.time()
-        xis_tensor, xis_loo_matrix = compute_xi_batched(p, total_input, top_blocks, temp, M, T+c, past_kv, H, batch_size=batch_size_xi)
+        xis_tensor, xis_loo_matrix = compute_xi_batched(p, total_input, top_blocks, temp, M, T+c, past_kv, H, batch_size=batch_size_xi, debug=debug)
         # xis_tensor: (K,), xis_loo_matrix: (K, M)
         dbg(f"compute_xi_batched: {time.time()-t0:.2f}s | total_rollouts={K*M}, batch_size={batch_size_xi} | GPU: {gpu_mem()}")
         del past_kv
@@ -430,10 +430,11 @@ def batched_scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K
         log_probs_a_pow = log_unnorm - torch.logsumexp(log_unnorm, dim=0)
         probs_a_pow = torch.exp(log_probs_a_pow)
 
-        # print(f"---- Token {t} -----")
-        # print("power_probs:", power_probs)                                                                                                                                                                                   
-        # print("xis_tensor:", xis_tensor)
-        # print("probs_a_power:", probs_a_pow)   
+        if debug == "probs":
+            print(f"  ---- Block {t} ----")
+            print(f"  power_probs : {power_probs.tolist()}")
+            print(f"  xis         : {xis_tensor.tolist()}")
+            print(f"  probs_a_pow : {probs_a_pow.tolist()}")
 
 
         # Broadcast power_probs (K,) -> (K, 1) to multiply with (K, M)

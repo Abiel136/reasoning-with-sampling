@@ -58,7 +58,7 @@ if __name__ == "__main__":
     print(f"Model: {model}")
     print(f"Device: {device}")
     print(f"Temperature (1/alpha): {temp}")
-    print(f"M (rollouts): {M}, T (trajectory): {T}, K (top-K): {K}")
+    print(f"M (rollouts): {M}, T (trajectory): {T}, K (top-K): {K}, Block_size: {block_size}, Batch_size: {batch_size}")
 
     if model == "qwen":
         # model_str = "Qwen/Qwen2.5-7B"
