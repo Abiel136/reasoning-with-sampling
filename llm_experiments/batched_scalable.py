@@ -5,6 +5,7 @@ import json
 import random
 from tqdm import tqdm
 import argparse
+import math 
 
 import pandas as pd
 import numpy as np
@@ -103,7 +104,7 @@ def top_K_from_base(p : AutoregressiveSampler, context, K, temp, L, block_size):
 
     Returns:
     :top_blocks: Token sequences of the K most probable blocks; shape (K, block_size)
-    :power_probs: Powered probs p(block)^(1/temp) for each top-K block; shape (K,)
+    :log_power_probs: Log powered probs (1/temp)*log p(block) for each top-K block; shape (K,)
     :past_kv: Cached key-values from the model for continuation
     """
 
@@ -155,19 +156,18 @@ def top_K_from_base(p : AutoregressiveSampler, context, K, temp, L, block_size):
     # Extract the top K blocks: shape (K, block_size)
     top_blocks = generated_tokens[top_K_indices]
     
-    # Compute power-scaled probabilities for the top K blocks
-    power_log_probs = (1/temp) * top_K_logprobs
-    power_probs = torch.exp(power_log_probs)
-    
+    # Compute log of power-scaled probabilities for the top K blocks
+    log_power_probs = (1/temp) * top_K_logprobs
+
     # Get cached key-values from context for efficient continuation
     output_cache = p.model(input_ids, use_cache=True)
     past_kv = output_cache.past_key_values
 
     del output, unscaled_logits, log_softmax_logits, generated_tokens, block_log_probs
-    del generated_tokens_t, idx, log_probs_tokens, top_K_logprobs, top_K_indices
+    del generated_tokens_t, idx, log_probs_tokens, top_K_indices
     del output_cache
 
-    return top_blocks, power_probs, past_kv
+    return top_blocks, log_power_probs, past_kv, top_K_logprobs
 
 
 @torch.no_grad()
@@ -244,15 +244,15 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_blocks, temp, M, T
     :param top_blocks: Tensor of K candidate block sequences; shape (K, block_size)
     :param temp: Alpha = 1/temp for power scaling
     :param M: Number of rollouts per candidate block
-    :param T: Total trajectory length (for compute_xi_batched, this is typically T+c)
+    :param T: Total generated trajectory length + prompt length (pass in T+c from before)
     :param past_kv: Cached key-values from the context for efficient generation
     :param H: rollout horizon length
     :param batch_size: Max rollouts per mini-batch (default: 0 ->  no batching)
     :param debug: None = silent | "verbose" = timing/memory info
 
     Returns:
-    :xis: Mean ζ estimate for each candidate block; shape (K,)
-    :xis_loos: Leave-one-out estimates for each candidate; shape (K, M)
+    :log_xis: Log of mean ζ estimate for each candidate block; shape (K,)
+    :log_xis_loo: Log of leave-one-out ζ estimates for each candidate; shape (K, M)
     """
     device = p.device
     tokenizer = p.tokenizer
@@ -304,13 +304,16 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_blocks, temp, M, T
         # A scalar (single position) would give wrong positional encodings for every token after the first.
         cache_position = torch.arange(ctx_len, ctx_len + block_size, dtype=torch.long, device=device)
 
+        # Rollout should be limited to T
+        max_new_tokens = min(T-c, H)
+
         t0 = time.time()
-        _dbg(f"Starting generate: input_ids={chunk_blocks.shape}, max_new_tokens={H}, cache_position={cache_position}")
+        _dbg(f"Starting generate: input_ids={chunk_blocks.shape}, max_new_tokens={max_new_tokens}, cache_position={cache_position}")
         output = p.model.generate(
             input_ids=chunk_blocks,
             past_key_values=expanded_kv,
             cache_position=cache_position,
-            max_new_tokens=H,
+            max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=1,
             eos_token_id=tokenizer.eos_token_id,
@@ -352,16 +355,21 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_blocks, temp, M, T
         del output, unscaled_logits, log_softmax_logits, gathered, idx
         del is_eos, cumulative_eos, valid_mask, masked_gathered, expanded_kv
 
-    log_probs_power = torch.cat(log_probs_power_parts, dim=0)  # (K*M,)
-    total_tensor = torch.exp(log_probs_power)
+    # (K*M,) log values — never exponentiate to avoid underflow
+    log_probs_power = torch.cat(log_probs_power_parts, dim=0)
 
-    # Reshape to (K, M) — rows are candidate blocks, columns are rollouts
-    total_matrix = total_tensor.reshape(K, M)
+    # Reshape to (K, M) in log space
+    log_matrix = log_probs_power.reshape(K, M)
 
-    xis = total_matrix.mean(dim=1)  # (K,)
-    xis_loos = (total_matrix.sum(dim=1, keepdim=True) - total_matrix) / (M - 1)  # (K, M)
+    # log(mean_m exp(x_km)) = logsumexp(x_km) - log(M)
+    log_xis = torch.logsumexp(log_matrix, dim=1) - math.log(M)  # (K,)
 
-    return xis, xis_loos
+    # log of LOO mean: log((sum_m exp(x_km) - exp(x_ks)) / (M-1))
+    # = log_total_k + log(1 - exp(x_ks - log_total_k)) - log(M-1)
+    log_total = torch.logsumexp(log_matrix, dim=1, keepdim=True)  # (K, 1)
+    log_xis_loo = log_total + torch.log1p(-torch.exp(log_matrix - log_total)) - math.log(M - 1)  # (K, M)
+
+    return log_xis, log_xis_loo
 
 
 
@@ -388,6 +396,7 @@ def batched_scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K
 
     print(f'alpha: {1/temp}')
 
+    # T + c is length prompt + total generated tokens
     c = len(prompt)
     total_input = []
     if prompt is not None:
@@ -412,39 +421,26 @@ def batched_scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K
         # Sample L candidate blocks and select top K by base model likelihood
         t0 = time.time()
         dbg(f"Before top_K_from_base | GPU: {gpu_mem()}")
-        top_blocks, power_probs, past_kv = top_K_from_base(p, total_input, K, temp, L, block_size)
-        # top_blocks: (K, block_size), power_probs: (K,)
+        top_blocks, log_power_probs, past_kv, top_K_logprobs = top_K_from_base(p, total_input, K, temp, L, block_size)
+        # top_blocks: (K, block_size), log_power_probs: (K,)
         dbg(f"top_K_from_base: {time.time()-t0:.2f}s | ctx_len={len(total_input)}, K={K}, L={L} | GPU: {gpu_mem()}")
 
         # For each of the K candidate blocks, run M rollouts to estimate lookahead value ζ
         # This requires expanding the block dimension to K*M
         t0 = time.time()
-        xis_tensor, xis_loo_matrix = compute_xi_batched(p, total_input, top_blocks, temp, M, T+c, past_kv, H, batch_size=batch_size_xi, debug=debug)
-        # xis_tensor: (K,), xis_loo_matrix: (K, M)
+        log_xis, log_xis_loo = compute_xi_batched(p, total_input, top_blocks, temp, M, T +c, past_kv, H, batch_size=batch_size_xi, debug=debug)
+        # log_xis: (K,), log_xis_loo: (K, M)
         dbg(f"compute_xi_batched: {time.time()-t0:.2f}s | total_rollouts={K*M}, batch_size={batch_size_xi} | GPU: {gpu_mem()}")
         del past_kv
 
         # Compute selection probabilities for top K blocks using power distribution
-        # Work in log space for numerical stability
-        log_unnorm = torch.log(power_probs.float()) + torch.log(xis_tensor + 1e-45)
+        # All in log space to avoid underflow
+        log_unnorm = log_power_probs + log_xis
         log_probs_a_pow = log_unnorm - torch.logsumexp(log_unnorm, dim=0)
         probs_a_pow = torch.exp(log_probs_a_pow)
 
-        if debug == "probs":
-            print(f"  ---- Block {t} ----")
-            print(f"  power_probs : {power_probs.tolist()}")
-            print(f"  xis         : {xis_tensor.tolist()}")
-            print(f"  probs_a_pow : {probs_a_pow.tolist()}")
-
-
-        # Broadcast power_probs (K,) -> (K, 1) to multiply with (K, M)
-
-        # unnorm_loo = power_probs.unsqueeze(1) * xis_loo_matrix
-
-        # # Normalize over tokens (dim=0) for each rollout s; shape: (K, M)
-        # probs_a_pow_loo = unnorm_loo / unnorm_loo.sum(dim=0, keepdim=True)
-
-        log_unnorm_loo = torch.log(power_probs.float()).unsqueeze(1) + torch.log(xis_loo_matrix + 1e-45)
+        
+        log_unnorm_loo = log_power_probs.unsqueeze(1) + log_xis_loo  # (K, M)
         log_probs_loo = log_unnorm_loo - torch.logsumexp(log_unnorm_loo, dim=0, keepdim=True)
         probs_a_pow_loo = torch.exp(log_probs_loo)
 
@@ -456,10 +452,19 @@ def batched_scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K
         probs_jk = probs_jk.clamp(min=0)
         probs_jk = probs_jk / probs_jk.sum()
 
+        if debug == "probs":
+            def fmt(t): return [float(f"{v:.3g}") for v in t.tolist()]
+            print(f"  ---- Block {t} ----")
+            print(f"  block_log_power_probs : {fmt(log_power_probs)}")
+            print(f"  log_xis               : {fmt(log_xis)}")
+            print(f"  probs_no_jk           : {fmt(probs_a_pow)}")
+            print(f"  probs_jk              : {fmt(probs_jk)}")
+            print(f"  base_probs            : {fmt(torch.exp(top_K_logprobs))}")
+            
         # Sample one of the K blocks according to the power distribution
         sampled_block_idx = torch.multinomial(probs_jk, 1).item()
         sampled_block = top_blocks[sampled_block_idx]
-        
+
         # Append the sampled block to the trajectory
         total_input.extend(sampled_block.tolist())
 
@@ -469,8 +474,8 @@ def batched_scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K
             total_input = total_input[:-len(sampled_block)] + sampled_block[:eos_idx+1].tolist()
             break
 
-        del top_blocks, power_probs, xis_tensor, probs_a_pow
-        del xis_loo_matrix, probs_a_pow_loo, probs_a_pow_loo_summed, probs_jk
+        del top_blocks, log_power_probs, log_xis, probs_a_pow
+        del log_xis_loo, probs_a_pow_loo, probs_a_pow_loo_summed, probs_jk
 
     
     # Generate the remainder block: q+1 = T - B*floor(T/B) + 1 tokens.
