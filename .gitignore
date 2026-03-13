@@ -8,4 +8,4 @@ runner.txt
 BLOCK_INTEGRATION_GUIDE.md                                                                                                                                                                                    
 BLOCK_SAMPLING_CHANGES.md                                                                                                                                                                                           
 BLOCK_SHAPES_REFERENCE.md
-# llm_experiments/shakespeare/ckpt.pt
+llm_experiments/shakespeare/ckpt.pt
