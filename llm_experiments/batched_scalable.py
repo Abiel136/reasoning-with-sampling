@@ -304,16 +304,16 @@ def compute_xi_batched(p: AutoregressiveSampler, context, top_blocks, temp, M, T
         # A scalar (single position) would give wrong positional encodings for every token after the first.
         cache_position = torch.arange(ctx_len, ctx_len + block_size, dtype=torch.long, device=device)
 
-        # Rollout should be limited to T
-        max_new_tokens = min(T-c, H)
-
+        # Rollout should be limited to T - i dont think so anymore
+        # max_new_tokens = min(T-c, H)
+        
         t0 = time.time()
-        _dbg(f"Starting generate: input_ids={chunk_blocks.shape}, max_new_tokens={max_new_tokens}, cache_position={cache_position}")
+        _dbg(f"Starting generate: input_ids={chunk_blocks.shape}, max_new_tokens={H}, cache_position={cache_position}")
         output = p.model.generate(
             input_ids=chunk_blocks,
             past_key_values=expanded_kv,
             cache_position=cache_position,
-            max_new_tokens=max_new_tokens,
+            max_new_tokens=H,
             do_sample=True,
             temperature=1,
             eos_token_id=tokenizer.eos_token_id,
@@ -415,7 +415,10 @@ def batched_scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K
     num_full_blocks = T // block_size
     remainder = T % block_size
 
-    # Process full blocks
+    argmax_match_count = 0
+    blocks_processed = 0
+
+    # Process full blocks. If blocks§
     for t in tqdm(range(num_full_blocks), desc="Scalable power blocks", unit="block"):
 
         # Sample L candidate blocks and select top K by base model likelihood
@@ -454,13 +457,18 @@ def batched_scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K
 
         if debug == "probs":
             def fmt(t): return [float(f"{v:.3g}") for v in t.tolist()]
-            print(f"  ---- Block {t} ----")
+            print(f"  ---- Block {t+1} ----")
             print(f"  block_log_power_probs : {fmt(log_power_probs)}")
             print(f"  log_xis               : {fmt(log_xis)}")
             print(f"  probs_no_jk           : {fmt(probs_a_pow)}")
             print(f"  probs_jk              : {fmt(probs_jk)}")
             print(f"  base_probs            : {fmt(torch.exp(top_K_logprobs))}")
+            print(f"  argmax match %        : {100.0 * argmax_match_count / blocks_processed:.1f}% ({argmax_match_count}/{blocks_processed})")
             
+        # Track how often argmax(probs_a_pow) == argmax(probs_jk)
+        argmax_match_count += int(probs_a_pow.argmax().item() == probs_jk.argmax().item())
+        blocks_processed += 1
+
         # Sample one of the K blocks according to the power distribution
         sampled_block_idx = torch.multinomial(probs_jk, 1).item()
         sampled_block = top_blocks[sampled_block_idx]
@@ -478,6 +486,10 @@ def batched_scalable_power_samp(p : AutoregressiveSampler, prompt, temp, M, T, K
         del log_xis_loo, probs_a_pow_loo, probs_a_pow_loo_summed, probs_jk
 
     
+    if blocks_processed > 0:
+        match_pct = 100.0 * argmax_match_count / blocks_processed
+        print(f"argmax(probs_a_pow) == argmax(probs_jk): {argmax_match_count}/{blocks_processed} blocks ({match_pct:.1f}%)")
+
     # Generate the remainder block: q+1 = T - B*floor(T/B) + 1 tokens.
     # Skip if EOS was already hit in the full-blocks loop.
     if remainder > 0 and total_input[-1] != p.tokenizer.eos_token_id:

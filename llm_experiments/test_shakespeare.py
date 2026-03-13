@@ -46,7 +46,8 @@ def main():
     tokenizer = GPT2Tokenizer.from_pretrained(model_path)
     model = GPT2LMHeadModel.from_pretrained(model_path).to(args.device)
     model.eval()
-    print(f"Model loaded on {args.device}")
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"Model loaded on {args.device} ({num_params/1e6:.1f}M parameters)")
 
     sampler = AutoregressiveSampler(model, tokenizer, args.device)
 
